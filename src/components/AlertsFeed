@@ -1,0 +1,82 @@
+import type { SystemAlert } from '@/types';
+import { alertConfig, timeAgo } from '@/lib/utils';
+import { Bell, AlertOctagon, AlertTriangle, Info } from 'lucide-react';
+
+interface AlertsFeedProps {
+  alerts: SystemAlert[];
+}
+
+const levelIcons = {
+  critical: AlertOctagon,
+  warning: AlertTriangle,
+  info: Info,
+};
+
+export function AlertsFeed({ alerts }: AlertsFeedProps) {
+  return (
+    <div className="flex h-full flex-col rounded-2xl border border-slate-800 bg-slate-900/60">
+      <div className="flex items-center justify-between border-b border-slate-800 px-5 py-3">
+        <div className="flex items-center gap-2">
+          <Bell className="h-4 w-4 text-amber-400" />
+          <h2 className="text-sm font-semibold text-white">System Alerts</h2>
+        </div>
+        <span className="flex items-center gap-1.5 text-xs text-slate-400">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+          </span>
+          Live
+        </span>
+      </div>
+
+        {alerts.length === 0 ? (
+          <div className="flex h-32 flex-col items-center justify-center text-center p-4 text-slate-500">
+            <Bell className="h-6 w-6 text-slate-600 mb-1 opacity-50" />
+            <div className="text-xs font-medium text-slate-400">No Critical Alerts</div>
+            <div className="text-[11px] text-slate-600">All surveillance sectors reporting normal</div>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {alerts.map((alert) => {
+              const config = alertConfig[alert.level];
+              const Icon = levelIcons[alert.level];
+
+              return (
+                <div
+                  key={alert.id}
+                  className={`rounded-xl border ${config.border} ${config.bg} p-3 transition-all hover:scale-[1.01]`}
+                >
+                  <div className="flex items-start gap-2.5">
+                    <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${config.bg} ${config.color}`}>
+                      <Icon className="h-3.5 w-3.5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="truncate text-xs font-semibold text-white">
+                          {alert.title}
+                        </h3>
+                        <span className="shrink-0 text-[10px] text-slate-500">
+                          {timeAgo(alert.created_at)}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 text-xs leading-relaxed text-slate-400">
+                        {alert.message}
+                      </p>
+                      {alert.source && (
+                        <div className="mt-1.5 flex items-center gap-1">
+                          <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
+                          <span className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                            {alert.source}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+  );
+}
