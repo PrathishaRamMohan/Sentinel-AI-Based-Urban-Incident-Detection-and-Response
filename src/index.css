@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100 antialiased;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-600;
+  }
+
+  /* Leaflet z-index fix for dark UI */
+  .leaflet-container {
+    background: #0f172a;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+  .leaflet-control-attribution {
+    background: rgba(15, 23, 42, 0.8) !important;
+    color: #64748b !important;
+  }
+  .leaflet-control-attribution a {
+    color: #94a3b8 !important;
+  }
+}
