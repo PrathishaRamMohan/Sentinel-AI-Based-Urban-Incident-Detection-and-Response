@@ -1,0 +1,165 @@
+import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from 'react';
+import { supabase } from '@/lib/supabase';
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  username?: string;
+  full_name: string | null;
+  role: 'citizen' | 'operator' | 'admin';
+}
+
+interface AuthContextValue {
+  user: UserProfile | null;
+  operator: UserProfile | null;
+  isOperator: boolean;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  operatorLogin: (usernameOrEmail: string, password: string) => Promise<UserProfile>;
+  register: (email: string, password: string, full_name?: string, phone?: string) => Promise<void>;
+  logout: () => Promise<void>;
+  operatorLogout: () => void;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+const OPERATOR_STORAGE_KEY = 'sentinel_operator_session';
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [operator, setOperator] = useState<UserProfile | null>(() => {
+    try {
+      const stored = localStorage.getItem(OPERATOR_STORAGE_KEY);
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const applySession = (sessionUser: { id: string; email?: string; user_metadata?: Record<string, unknown> } | null) => {
+      if (!sessionUser) {
+        setUser(null);
+        return;
+      }
+      setUser({
+        id: sessionUser.id,
+        email: sessionUser.email ?? '',
+        full_name: typeof sessionUser.user_metadata?.full_name === 'string' ? sessionUser.user_metadata.full_name : null,
+        role: 'citizen',
+      });
+    };
+
+    supabase.auth.getSession().then(({ data }) => applySession(data.session?.user ?? null));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      applySession(session?.user ?? null);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  const login = useCallback(async (email: string, password: string) => {
+    setLoading(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const operatorLogin = useCallback(async (usernameOrEmail: string, password: string): Promise<UserProfile> => {
+    setLoading(true);
+    try {
+      const cleanUser = usernameOrEmail.trim().toLowerCase();
+      // Verify credentials: allow official operator demo credentials or Supabase authenticated operators
+      const isDemoOperator =
+        (cleanUser === 'operator' || cleanUser === 'operator@sentinel.gov' || cleanUser === 'admin' || cleanUser === 'dispatch') &&
+        (password === 'operator123' || password === 'admin123' || password === 'sentinel2026' || password === 'password');
+
+      let operatorProfile: UserProfile;
+
+      if (isDemoOperator) {
+        operatorProfile = {
+          id: 'op-sentinel-01',
+          email: cleanUser.includes('@') ? cleanUser : `${cleanUser}@sentinel.gov`,
+          username: cleanUser,
+          full_name: 'Lead Dispatcher / System Operator',
+          role: cleanUser === 'admin' ? 'admin' : 'operator',
+        };
+      } else {
+        // Try Supabase auth
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: cleanUser.includes('@') ? cleanUser : `${cleanUser}@sentinel.gov`,
+          password,
+        });
+        if (error) {
+          throw new Error('Invalid Control Room Operator credentials. Please verify your username and password.');
+        }
+        operatorProfile = {
+          id: data.user.id,
+          email: data.user.email ?? '',
+          username: cleanUser,
+          full_name: typeof data.user.user_metadata?.full_name === 'string' ? data.user.user_metadata.full_name : 'Control Room Operator',
+          role: 'operator',
+        };
+      }
+
+      setOperator(operatorProfile);
+      localStorage.setItem(OPERATOR_STORAGE_KEY, JSON.stringify(operatorProfile));
+      return operatorProfile;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const operatorLogout = useCallback(() => {
+    setOperator(null);
+    localStorage.removeItem(OPERATOR_STORAGE_KEY);
+  }, []);
+
+  const register = useCallback(async (email: string, password: string, full_name?: string, phone?: string) => {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { full_name, phone } },
+      });
+      if (error) throw error;
+      if (!data.session) throw new Error('Registration succeeded. Confirm your email before signing in.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const logout = useCallback(async () => {
+    const { error } = await supabase.auth.signOut();
+    operatorLogout();
+    if (error) throw error;
+  }, [operatorLogout]);
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        operator,
+        isOperator: Boolean(operator),
+        loading,
+        login,
+        operatorLogin,
+        register,
+        logout,
+        operatorLogout,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+  return ctx;
+}
