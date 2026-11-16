@@ -1,0 +1,278 @@
+"""Backend tests for SENTINEL API.
+
+Tests use httpx.AsyncClient with the FastAPI TestClient, and a test database
+session that rolls back after each test to keep tests isolated.
+
+Run with: cd backend && python -m pytest tests/ -v
+"""
+
+import os
+import sys
+import uuid
+from typing import Generator
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+# Ensure app is importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.database import Base, get_db
+from app.models import User, Incident, CitizenReport
+from app.auth import hash_password, create_access_token
+from app.main import app
+
+# Use a test database or the Supabase DB with a test schema
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", ""))
+
+if TEST_DATABASE_URL:
+    test_engine = create_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+else:
+    test_engine = None
+    TestSessionLocal = None
+
+
+@pytest.fixture(scope="function")
+def db_session() -> Generator:
+    """Provide a database session that rolls back after each test."""
+    if test_engine is None:
+        pytest.skip("No test database configured")
+    # Use a transaction that we roll back
+    connection = test_engine.connect()
+    transaction = connection.begin()
+    session = TestSessionLocal(bind=connection)
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture(scope="function")
+def client(db_session) -> Generator:
+    """FastAPI TestClient with the test database session injected."""
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def test_user(db_session) -> User:
+    """Create a test citizen user."""
+    user = User(
+        email="test_citizen@sentinel.test",
+        password_hash=hash_password("testpass123"),
+        full_name="Test Citizen",
+        role="citizen",
+    )
+    db_session.add(user)
+    db_session.flush()
+    return user
+
+
+@pytest.fixture
+def auth_headers(test_user) -> dict:
+    """Return auth headers for the test user."""
+    token = create_access_token(test_user.id)
+    return {"Authorization": f"Bearer {token}"}
+
+
+# ─── Tests ──────────────────────────────────────────────────
+
+
+class TestHealth:
+    def test_health_endpoint(self, client):
+        """GET /api/v1/health returns 200 with service info."""
+        resp = client.get("/api/v1/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["service"] == "sentinel-api"
+        assert "database" in data
+
+
+class TestCitizenReportCreation:
+    def test_create_citizen_report_anonymous(self, client, db_session):
+        """POST /api/v1/citizen-reports creates a report and incident without auth."""
+        payload = {
+            "incident_type": "Road Accident",
+            "description": "Two-car collision at intersection",
+            "latitude": 40.7589,
+            "longitude": -73.9851,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["incident_type"] == "Road Accident"
+        assert data["latitude"] == 40.7589
+        assert data["longitude"] == -73.9851
+        assert data["incident_id"] is not None
+
+        # Verify incident was created
+        incident_id = uuid.UUID(data["incident_id"])
+        incident = db_session.query(Incident).filter(Incident.id == incident_id).first()
+        assert incident is not None
+        assert incident.source == "CITIZEN"
+        assert incident.status == "Detected"
+        assert incident.type == "Road Accident"
+
+    def test_create_citizen_report_authenticated(self, client, auth_headers):
+        """POST /api/v1/citizen-reports with auth links the report to the user."""
+        payload = {
+            "incident_type": "Fire",
+            "description": "Small fire in trash bin",
+            "latitude": 40.7505,
+            "longitude": -73.9934,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload, headers=auth_headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["user_id"] is not None
+
+    def test_create_report_invalid_incident_type(self, client):
+        """Invalid incident type returns 422."""
+        payload = {
+            "incident_type": "Alien Invasion",
+            "latitude": 40.75,
+            "longitude": -73.98,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 422
+
+    def test_create_report_missing_location(self, client):
+        """Missing latitude/longitude returns 422."""
+        payload = {
+            "incident_type": "Fire",
+            "description": "No location provided",
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 422
+
+
+class TestCoordinateValidation:
+    def test_invalid_latitude(self, client):
+        """Latitude > 90 returns 422."""
+        payload = {
+            "incident_type": "Medical Emergency",
+            "latitude": 95.0,
+            "longitude": -73.98,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 422
+
+    def test_invalid_longitude(self, client):
+        """Longitude < -180 returns 422."""
+        payload = {
+            "incident_type": "Medical Emergency",
+            "latitude": 40.75,
+            "longitude": -200.0,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 422
+
+    def test_boundary_coordinates(self, client):
+        """Coordinates at exact boundaries (90, 180) are accepted."""
+        payload = {
+            "incident_type": "Other",
+            "latitude": 90.0,
+            "longitude": 180.0,
+        }
+        resp = client.post("/api/v1/citizen-reports", json=payload)
+        assert resp.status_code == 201
+
+
+class TestIncidentRetrieval:
+    def test_get_incident_by_id(self, client, db_session):
+        """GET /api/v1/incidents/{id} returns the incident."""
+        incident = Incident(
+            type="Fire",
+            incident_type="Fire",
+            location_name="Test Location",
+            latitude=40.75,
+            longitude=-73.98,
+            severity="High",
+            status="Detected",
+            source="CITIZEN",
+            confidence=0.0,
+        )
+        db_session.add(incident)
+        db_session.flush()
+
+        resp = client.get(f"/api/v1/incidents/{incident.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == str(incident.id)
+        assert data["type"] == "Fire"
+
+    def test_get_incident_not_found(self, client):
+        """GET /api/v1/incidents/{random_id} returns 404."""
+        random_id = uuid.uuid4()
+        resp = client.get(f"/api/v1/incidents/{random_id}")
+        assert resp.status_code == 404
+
+    def test_list_incidents(self, client, db_session):
+        """GET /api/v1/incidents returns a list."""
+        incident = Incident(
+            type="Road Accident",
+            incident_type="Road Accident",
+            location_name="Test",
+            latitude=40.75,
+            longitude=-73.98,
+            severity="Medium",
+            status="Detected",
+            source="CITIZEN",
+            confidence=0.0,
+        )
+        db_session.add(incident)
+        db_session.flush()
+
+        resp = client.get("/api/v1/incidents")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "incidents" in data
+        assert "total" in data
+        assert data["total"] >= 1
+
+
+class TestAuth:
+    def test_register_new_user(self, client, db_session):
+        """POST /api/v1/auth/register creates a user and returns a token."""
+        resp = client.post(
+            "/api/v1/auth/register",
+            json={"email": "newuser@sentinel.test", "password": "securepass123", "full_name": "New User"},
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "access_token" in data
+        assert data["user"]["email"] == "newuser@sentinel.test"
+        assert data["user"]["role"] == "citizen"
+
+    def test_register_duplicate_email(self, client, test_user):
+        """Duplicate email returns 409."""
+        resp = client.post(
+            "/api/v1/auth/register",
+            json={"email": "test_citizen@sentinel.test", "password": "anotherpass"},
+        )
+        assert resp.status_code == 409
+
+    def test_login_success(self, client, test_user):
+        """POST /api/v1/auth/login with valid credentials returns a token."""
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "test_citizen@sentinel.test", "password": "testpass123"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "access_token" in data
+
+    def test_login_wrong_password(self, client, test_user):
+        """Wrong password returns 401."""
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "test_citizen@sentinel.test", "password": "wrongpassword"},
+        )
+        assert resp.status_code == 401
